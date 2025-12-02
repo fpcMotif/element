@@ -33,6 +33,7 @@ import { UserFriendlyError } from "../languageHandler";
 import { ModuleApi } from "../modules/Api";
 import { RoomView } from "../components/structures/RoomView";
 import RoomAvatar from "../components/views/avatars/RoomAvatar";
+import { ConvexProviderWrapper } from "../convex/ConvexProviderWrapper";
 
 logger.log(`Application is running in ${process.env.NODE_ENV} mode`);
 
@@ -116,17 +117,19 @@ export async function loadApp(fragParams: QueryDict, matrixChatRef: React.Ref<Ma
     return (
         <wrapperOpts.Wrapper>
             <StrictMode>
-                <MatrixChat
-                    ref={matrixChatRef}
-                    onNewScreen={onNewScreen}
-                    config={config}
-                    realQueryParams={params}
-                    startingFragmentQueryParams={fragParams}
-                    enableGuest={!config.disable_guests}
-                    onTokenLoginCompleted={onTokenLoginCompleted}
-                    initialScreenAfterLogin={initialScreenAfterLogin}
-                    defaultDeviceDisplayName={defaultDeviceName}
-                />
+                <ConvexProviderWrapper>
+                    <MatrixChat
+                        ref={matrixChatRef}
+                        onNewScreen={onNewScreen}
+                        config={config}
+                        realQueryParams={params}
+                        startingFragmentQueryParams={fragParams}
+                        enableGuest={!config.disable_guests}
+                        onTokenLoginCompleted={onTokenLoginCompleted}
+                        initialScreenAfterLogin={initialScreenAfterLogin}
+                        defaultDeviceDisplayName={defaultDeviceName}
+                    />
+                </ConvexProviderWrapper>
             </StrictMode>
         </wrapperOpts.Wrapper>
     );
