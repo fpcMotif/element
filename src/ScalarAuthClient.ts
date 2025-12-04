@@ -9,6 +9,8 @@ Please see LICENSE files in the repository root for full details.
 import { logger } from "matrix-js-sdk/src/logger";
 import { SERVICE_TYPES, type Room, type IOpenIDToken } from "matrix-js-sdk/src/matrix";
 
+import { Effect, type Effect as EffectType } from "effect/Effect";
+import { HttpStatusError, requestJson, requestText } from "./utils/effects/http";
 import SettingsStore from "./settings/SettingsStore";
 import { Service, startTermsFlow, type TermsInteractionCallback, TermsNotSignedError } from "./Terms";
 import { MatrixClientPeg } from "./MatrixClientPeg";
@@ -18,6 +20,15 @@ import { parseUrl } from "./utils/UrlUtils";
 
 // The version of the integration manager API we're intending to work with
 const imApiVersion = "1.1";
+
+class ScalarRequestError extends Error {
+    public constructor(public readonly status: number) {
+        super(`Scalar request failed: ${status}`);
+        this.name = "ScalarRequestError";
+    }
+}
+
+type ScalarEffect<T> = EffectType<Error, T>;
 
 // TODO: Generify the name of this class and all components within - it's not just for Scalar.
 
@@ -41,6 +52,14 @@ export default class ScalarAuthClient {
         const configUiUrl = SdkConfig.get("integrations_ui_url");
         this.isDefaultManager = apiUrl === configApiUrl && configUiUrl === uiUrl;
     }
+
+    private mapHttpError = (error: unknown): Error => {
+        if (error instanceof HttpStatusError) {
+            return new ScalarRequestError(error.status);
+        }
+
+        return error as Error;
+    };
 
     private writeTokenToStore(): void {
         window.localStorage.setItem("mx_scalar_token_at_" + this.apiUrl, this.scalarToken ?? "");
@@ -70,9 +89,13 @@ export default class ScalarAuthClient {
     }
 
     public connect(): Promise<void> {
-        return this.getScalarToken().then((tok) => {
-            this.scalarToken = tok;
-        });
+        return Effect.runPromise(
+            this.getScalarTokenEffect().tap((token) =>
+                Effect.sync(() => {
+                    this.scalarToken = token;
+                }),
+            ),
+        );
     }
 
     public hasCredentials(): boolean {
@@ -81,57 +104,64 @@ export default class ScalarAuthClient {
 
     // Returns a promise that resolves to a scalar_token string
     public getScalarToken(): Promise<string> {
-        const token = this.readToken();
-
-        if (!token) {
-            return this.registerForToken();
-        } else {
-            return this.checkToken(token).catch((e) => {
-                if (e instanceof TermsNotSignedError) {
-                    // retrying won't help this
-                    throw e;
-                }
-                return this.registerForToken();
-            });
-        }
+        return Effect.runPromise(this.getScalarTokenEffect());
     }
 
-    private async getAccountName(token: string): Promise<string> {
+    private getScalarTokenEffect(): ScalarEffect<string> {
+        return Effect.sync(() => this.readToken())
+            .flatMap((token) => {
+                if (!token) {
+                    return this.registerForTokenEffect();
+                }
+
+                return this.checkTokenEffect(token).catchAll((error) => {
+                    if (error instanceof TermsNotSignedError) {
+                        // retrying won't help this
+                        return Effect.fail(error);
+                    }
+                    return this.registerForTokenEffect();
+                });
+            })
+            .tap((token) =>
+                Effect.sync(() => {
+                    this.scalarToken = this.scalarToken ?? token;
+                }),
+            );
+    }
+
+    private getAccountNameEffect(token: string): ScalarEffect<string> {
         const url = new URL(this.apiUrl + "/account");
         url.searchParams.set("scalar_token", token);
         url.searchParams.set("v", imApiVersion);
 
-        const res = await fetch(url, {
+        return requestJson<{ user_id?: string; errcode?: string }>(url, {
             method: "GET",
-        });
+        })
+            .mapError(this.mapHttpError)
+            .flatMap((body) => {
+                if (body?.errcode === "M_TERMS_NOT_SIGNED") {
+                    return Effect.fail(new TermsNotSignedError());
+                }
 
-        const body = await res.json();
-        if (body?.errcode === "M_TERMS_NOT_SIGNED") {
-            throw new TermsNotSignedError();
-        }
+                if (!body?.user_id) {
+                    return Effect.fail(new Error("Missing user_id in response"));
+                }
 
-        if (!res.ok) {
-            throw body;
-        }
-
-        if (!body?.user_id) {
-            throw new Error("Missing user_id in response");
-        }
-
-        return body.user_id;
+                return Effect.succeed(body.user_id);
+            });
     }
 
-    private checkToken(token: string): Promise<string> {
-        return this.getAccountName(token)
-            .then((userId) => {
+    private checkTokenEffect(token: string): ScalarEffect<string> {
+        return this.getAccountNameEffect(token)
+            .flatMap((userId) => {
                 const me = MatrixClientPeg.safeGet().getUserId();
                 if (userId !== me) {
-                    throw new Error("Scalar token is owned by someone else: " + me);
+                    return Effect.fail(new Error("Scalar token is owned by someone else: " + me));
                 }
-                return token;
+                return Effect.succeed(token);
             })
-            .catch((e) => {
-                if (e instanceof TermsNotSignedError) {
+            .catchAll((error) => {
+                if (error instanceof TermsNotSignedError) {
                     logger.log("Integration manager requires new terms to be agreed to");
                     // The terms endpoints are new and so live on standard _matrix prefixes,
                     // but IM rest urls are currently configured with paths, so remove the
@@ -149,76 +179,87 @@ export default class ScalarAuthClient {
                     // a regular base url.
                     const parsedImRestUrl = parseUrl(this.apiUrl);
                     parsedImRestUrl.pathname = "";
-                    return startTermsFlow(
-                        MatrixClientPeg.safeGet(),
-                        [new Service(SERVICE_TYPES.IM, parsedImRestUrl.toString(), token)],
-                        this.termsInteractionCallback,
-                    ).then(() => {
-                        return token;
-                    });
-                } else {
-                    throw e;
+                    return Effect.fromPromise(
+                        () =>
+                            startTermsFlow(
+                                MatrixClientPeg.safeGet(),
+                                [new Service(SERVICE_TYPES.IM, parsedImRestUrl.toString(), token)],
+                                this.termsInteractionCallback,
+                            ),
+                        (err) => (err instanceof Error ? err : new Error(String(err))),
+                    ).map(() => token);
                 }
+
+                return Effect.fail(error);
             });
     }
 
     public registerForToken(): Promise<string> {
-        // Get openid bearer token from the HS as the first part of our dance
-        return MatrixClientPeg.safeGet()
-            .getOpenIdToken()
-            .then((tokenObject) => {
-                // Now we can send that to scalar and exchange it for a scalar token
-                return this.exchangeForScalarToken(tokenObject);
-            })
-            .then((token) => {
-                // Validate it (this mostly checks to see if the IM needs us to agree to some terms)
-                return this.checkToken(token);
-            })
-            .then((token) => {
-                this.scalarToken = token;
-                this.writeTokenToStore();
-                return token;
-            });
+        return Effect.runPromise(this.registerForTokenEffect());
     }
 
-    public async exchangeForScalarToken(openidTokenObject: IOpenIDToken): Promise<string> {
+    private registerForTokenEffect(): ScalarEffect<string> {
+        // Get openid bearer token from the HS as the first part of our dance
+        return Effect.fromPromise(() => MatrixClientPeg.safeGet().getOpenIdToken())
+            .flatMap((tokenObject) => {
+                // Now we can send that to scalar and exchange it for a scalar token
+                return Effect.fromPromise(() => this.exchangeForScalarToken(tokenObject), (error) => error as Error);
+            })
+            .flatMap((token) => {
+                // Validate it (this mostly checks to see if the IM needs us to agree to some terms)
+                return this.checkTokenEffect(token);
+            })
+            .tap((token) =>
+                Effect.sync(() => {
+                    this.scalarToken = token;
+                    this.writeTokenToStore();
+                }),
+            );
+    }
+
+    public exchangeForScalarToken(openidTokenObject: IOpenIDToken): Promise<string> {
+        return Effect.runPromise(this.exchangeForScalarTokenEffect(openidTokenObject));
+    }
+
+    private exchangeForScalarTokenEffect(openidTokenObject: IOpenIDToken): ScalarEffect<string> {
         const scalarRestUrl = new URL(this.apiUrl + "/register");
         scalarRestUrl.searchParams.set("v", imApiVersion);
 
-        const res = await fetch(scalarRestUrl, {
+        return requestJson<{ scalar_token?: string }>(scalarRestUrl, {
             method: "POST",
             body: JSON.stringify(openidTokenObject),
             headers: {
                 "Content-Type": "application/json",
             },
-        });
+        })
+            .mapError((error) => {
+                if (error instanceof HttpStatusError) {
+                    return new ScalarRequestError(error.status);
+                }
+                return error as Error;
+            })
+            .flatMap((body) => {
+                if (!body?.scalar_token) {
+                    return Effect.fail(new Error("Missing scalar_token in response"));
+                }
 
-        if (!res.ok) {
-            throw new Error(`Scalar request failed: ${res.status}`);
-        }
-
-        const body = await res.json();
-        if (!body?.scalar_token) {
-            throw new Error("Missing scalar_token in response");
-        }
-
-        return body.scalar_token;
+                return Effect.succeed(body.scalar_token);
+            });
     }
 
-    public async getScalarPageTitle(url: string): Promise<string> {
+    public getScalarPageTitle(url: string): Promise<string> {
+        return Effect.runPromise(this.getScalarPageTitleEffect(url));
+    }
+
+    private getScalarPageTitleEffect(url: string): ScalarEffect<string> {
         const scalarPageLookupUrl = new URL(this.getStarterLink(this.apiUrl + "/widgets/title_lookup"));
         scalarPageLookupUrl.searchParams.set("curl", encodeURIComponent(url));
 
-        const res = await fetch(scalarPageLookupUrl, {
+        return requestJson<{ page_title_cache_item?: { cached_title?: string } }>(scalarPageLookupUrl, {
             method: "GET",
-        });
-
-        if (!res.ok) {
-            throw new Error(`Scalar request failed: ${res.status}`);
-        }
-
-        const body = await res.json();
-        return body?.page_title_cache_item?.cached_title;
+        })
+            .mapError(this.mapHttpError)
+            .map((body) => body?.page_title_cache_item?.cached_title);
     }
 
     /**
@@ -229,24 +270,27 @@ export default class ScalarAuthClient {
      * @param  {string} widgetId   The widget ID to disable assets for
      * @return {Promise}           Resolves on completion
      */
-    public async disableWidgetAssets(widgetType: WidgetType, widgetId: string): Promise<void> {
+    public disableWidgetAssets(widgetType: WidgetType, widgetId: string): Promise<void> {
+        return Effect.runPromise(this.disableWidgetAssetsEffect(widgetType, widgetId));
+    }
+
+    private disableWidgetAssetsEffect(widgetType: WidgetType, widgetId: string): ScalarEffect<void> {
         const url = new URL(this.getStarterLink(this.apiUrl + "/widgets/set_assets_state"));
         url.searchParams.set("widget_type", widgetType.preferred);
         url.searchParams.set("widget_id", widgetId);
         url.searchParams.set("state", "disable");
 
-        const res = await fetch(url, {
+        return requestText(url, {
             method: "GET", // XXX: Actions shouldn't be GET requests
-        });
+        })
+            .mapError(this.mapHttpError)
+            .flatMap((body) => {
+                if (!body) {
+                    return Effect.fail(new Error("Failed to set widget assets state"));
+                }
 
-        if (!res.ok) {
-            throw new Error(`Scalar request failed: ${res.status}`);
-        }
-
-        const body = await res.text();
-        if (!body) {
-            throw new Error("Failed to set widget assets state");
-        }
+                return Effect.succeed(undefined);
+            });
     }
 
     public getScalarInterfaceUrlForRoom(room: Room, screen?: string, id?: string): string {

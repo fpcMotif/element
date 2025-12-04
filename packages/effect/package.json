@@ -1,0 +1,12 @@
+{
+  "name": "effect",
+  "version": "0.0.0-local",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "type": "commonjs",
+  "exports": {
+    "./Effect": "./Effect.js",
+    "./Function": "./Function.js",
+    "./package.json": "./package.json"
+  }
+}
